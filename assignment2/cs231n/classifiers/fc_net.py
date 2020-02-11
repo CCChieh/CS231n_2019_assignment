@@ -195,22 +195,15 @@ class FullyConnectedNet(object):
         ############################################################################
         # *****START OF YOUR CODE (DO NOT DELETE/MODIFY THIS LINE)*****
 
-        for i in range(self.num_layers):
-            dim = []
-            if i == 0:
-                dim.append(input_dim)
-                dim.append(hidden_dims[i])
-            elif i == self.num_layers - 1:
-                dim.append(hidden_dims[i - 1])
-                dim.append(num_classes)
-            else:
-                dim.append(hidden_dims[i - 1])
-                dim.append(hidden_dims[i])
-            self.params['W' + str(i + 1)] = np.random.normal(scale=weight_scale, size=dim).astype(dtype)
-            self.params['b' + str(i + 1)] = np.zeros(dim[1], dtype=dtype)
-            if i != self.num_layers - 1 and (self.normalization == 'batchnorm' or self.normalization == 'layernorm'):
-                self.params['gamma' + str(i + 1)] = np.ones(dim[1], dtype=dtype)
-                self.params['beta' + str(i + 1)] = np.zeros(dim[1], dtype=dtype)
+        all_dims = [input_dim] + hidden_dims + [num_classes]
+        for layer_id in range(1, self.num_layers + 1):
+            w = weight_scale * np.random.randn(all_dims[layer_id - 1], all_dims[layer_id])
+            b = np.zeros(all_dims[layer_id])
+            self.params['W%d' % layer_id], self.params['b%d' % layer_id] = w, b
+
+            if (self.normalization == 'batchnorm' or self.normalization == 'layernorm') and layer_id < self.num_layers:
+                self.params['gamma%d' % layer_id] = np.ones(all_dims[layer_id])
+                self.params['beta%d' % layer_id] = np.zeros(all_dims[layer_id])
 
         # *****END OF YOUR CODE (DO NOT DELETE/MODIFY THIS LINE)*****
         ############################################################################
@@ -273,29 +266,41 @@ class FullyConnectedNet(object):
         ############################################################################
         # *****START OF YOUR CODE (DO NOT DELETE/MODIFY THIS LINE)*****
 
-        scores = X
-        caches = []
-        for i in range(self.num_layers):
-            w = self.params['W' + str(i + 1)]
-            b = self.params['b' + str(i + 1)]
-            if i == self.num_layers - 1:
-                scores, cache = affine_forward(scores, w, b)
-            else:
-                if self.normalization is None:
-                    scores, cache = affine_relu_forward(scores, w, b)
-                else:
-                    gamma = self.params['gamma' + str(i + 1)]
-                    beta = self.params['beta' + str(i + 1)]
-                    if self.normalization == 'batchnorm':
-                        scores, cache = affine_bn_relu_forward(scores, w, b, gamma, beta, self.bn_params[i])
-                    elif self.normalization == 'layernorm':
-                        scores, cache = affine_ln_relu_forward(scores, w, b, gamma, beta, self.bn_params[i])
-                    else:
-                        cache = None
-            caches.append(cache)
-            if self.use_dropout and i != self.num_layers - 1:
-                scores, cache = dropout_forward(scores, self.dropout_param)
-                caches.append(cache)
+        current_x = X
+        caches = {}
+        
+        for layer_id in range(1, self.num_layers):
+            # forward pass through current affine layer
+            current_x, cache = affine_forward(current_x, self.params['W%d' % layer_id],
+                                              self.params['b%d' % layer_id])
+
+            # save cache for backward pass
+            caches['affine%d' % layer_id] = cache
+
+            if self.normalization == 'batchnorm':
+                current_x, cache = batchnorm_forward(current_x,
+                                                     self.params['gamma%d' % layer_id],
+                                                     self.params['beta%d' % layer_id],
+                                                     self.bn_params[layer_id - 1])
+                caches['batchnorm%d' % layer_id] = cache
+            elif self.normalization == 'layernorm':
+                current_x, cache = layernorm_forward(current_x,
+                                                     self.params['gamma%d' % layer_id],
+                                                     self.params['beta%d' % layer_id],
+                                                     self.bn_params[layer_id - 1])
+                caches['layernorm%d' % layer_id] = cache
+
+            # forward pass through current ReLU layer and saving ReLU cache
+            current_x, cache = relu_forward(current_x)
+            caches['relu%d' % layer_id] = cache
+
+            if self.use_dropout:
+                current_x, cache = dropout_forward(current_x, self.dropout_param)
+                caches['dropout%d' % layer_id] = cache
+
+        # final affine layer
+        scores, cache_out = affine_forward(current_x, self.params['W%d' % self.num_layers],
+                                           self.params['b%d' % self.num_layers])
 
 
         # *****END OF YOUR CODE (DO NOT DELETE/MODIFY THIS LINE)*****
@@ -323,27 +328,40 @@ class FullyConnectedNet(object):
         ############################################################################
         # *****START OF YOUR CODE (DO NOT DELETE/MODIFY THIS LINE)*****
 
-        loss, dx = softmax_loss(scores, y)
-        for i in range(self.num_layers):
-            loss += 0.5 * self.reg * np.sum(self.params['W' + str(i + 1)] ** 2)
-        for i in reversed(range(self.num_layers)):
-            w = 'W' + str(i + 1)
-            b = 'b' + str(i + 1)
-            gamma = 'gamma' + str(i + 1)
-            beta = 'beta' + str(i + 1)
-            if i == self.num_layers - 1:
-                dx, grads[w], grads[b] = affine_backward(dx, caches.pop())
-            else:
-                if self.use_dropout:
-                    dx = dropout_backward(dx, caches.pop())
-                if self.normalization is None:
-                    dx, grads[w], grads[b] = affine_relu_backward(dx, caches.pop())
-                elif self.normalization == 'batchnorm':
-                    dx, grads[w], grads[b], grads[gamma], grads[beta] = affine_bn_relu_backward(dx, caches.pop())
-                elif self.normalization == 'layernorm':
-                    dx, grads[w], grads[b], grads[gamma], grads[beta] = affine_ln_relu_backward(dx, caches.pop())
+        # calculating softmax loss with regularizers for weights in all layers
+        loss, grad_loss = softmax_loss(scores, y)
+        for layer_id in range(self.num_layers):
+            loss += self.reg * np.sum(self.params['W%d' % (layer_id + 1)] ** 2) / 2
 
-            grads[w] += self.reg * self.params[w]
+        # backward pass through final affine layer
+        grad_current_x, dw, db = affine_backward(grad_loss, cache_out)
+        grads['W%d' % self.num_layers] = dw + self.reg * self.params['W%d' % self.num_layers]
+        grads['b%d' % self.num_layers] = db
+
+        # loop over L-1 cycles : {affine - [batch norm] - relu - [dropout]} x (L - 1)
+        for layer_id in range(self.num_layers - 1, 0, -1):
+            if self.use_dropout:
+                grad_current_x = dropout_backward(grad_current_x, caches['dropout%d' % layer_id])
+
+            # backward pass through current ReLU layer
+            grad_current_x = relu_backward(grad_current_x, caches['relu%d' % layer_id])
+
+            if self.normalization == 'batchnorm':
+                grad_current_x, grad_gamma, grad_beta = batchnorm_backward(grad_current_x,
+                                                                           caches['batchnorm%d' % layer_id])
+                grads['gamma%d' % layer_id] = grad_gamma
+                grads['beta%d' % layer_id] = grad_beta
+
+            elif self.normalization == 'layernorm':
+                grad_current_x, grad_gamma, grad_beta = layernorm_backward(grad_current_x,
+                                                                           caches['layernorm%d' % layer_id])
+                grads['gamma%d' % layer_id] = grad_gamma
+                grads['beta%d' % layer_id] = grad_beta
+
+            # backward pass through current affine layer
+            grad_current_x, dw, db = affine_backward(grad_current_x, caches['affine%d' % layer_id])
+            grads['W%d' % layer_id] = dw + self.reg * self.params['W%d' % layer_id]
+            grads['b%d' % layer_id] = db
 
         # *****END OF YOUR CODE (DO NOT DELETE/MODIFY THIS LINE)*****
         ############################################################################
